@@ -13,8 +13,10 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import re
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -177,9 +179,62 @@ BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
+# ---------------------------------------------------------------------------
+# Per-card cost fields (estimated spend, USD)
+#
+# cost_usd      — actual estimated spend recorded for the task's worker
+#                 session (state.db session_model_usage). None until the
+#                 card has a worker session with recorded usage.
+# est_cost_usd  — the machine-parseable "💰 **Est cost:** $X" line from the
+#                 card body, if present (kanban-mission-control convention).
+# ---------------------------------------------------------------------------
 
-def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
-               current_run_started_at: Optional[int] = None) -> dict[str, Any]:
+_SESSION_COST_CACHE: dict[str, float] = {}
+
+
+def _session_cost_usd(session_id: Optional[str]) -> Optional[float]:
+    """Sum of estimated_cost_usd for a task session (aux rows excluded)."""
+    if not session_id:
+        return None
+    cached = _SESSION_COST_CACHE.get(session_id)
+    if cached is not None:
+        return cached or None
+    val = 0.0
+    try:
+        from hermes_cli.web_server_sessions import _open_session_db_for_profile
+
+        db = _open_session_db_for_profile(None, read_only=True)
+        try:
+            row = db._conn.execute(
+                "SELECT COALESCE(SUM(estimated_cost_usd), 0) "
+                "FROM session_model_usage WHERE session_id=? AND task=''",
+                (session_id,),
+            ).fetchone()
+            val = float(row[0] or 0.0)
+        finally:
+            db.close()
+    except Exception:
+        val = 0.0
+    _SESSION_COST_CACHE[session_id] = val
+    return val if val > 0 else None
+
+
+_EST_COST_BODY_RE = re.compile(r"\*\*Est cost[^:]*:\*\*\s*[~≈]?\$?([\d.]+)")
+
+
+def _est_cost_from_body(body: Optional[str]) -> Optional[float]:
+    if not body:
+        return None
+    m = _EST_COST_BODY_RE.search(body)
+    return float(m.group(1)) if m else None
+
+
+def _task_dict(
+    task: kanban_db.Task,
+    *,
+    latest_summary: Optional[str] = None,
+    current_run_started_at: Optional[int] = None,
+) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -191,6 +246,11 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
+    # Estimated spend for the card: actual (worker session usage) + the
+    # machine-parseable estimate from the body, when present.
+    d["cost_usd"] = _session_cost_usd(task.session_id)
+    d["est_cost_usd"] = _est_cost_from_body(task.body)
+    # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
 
@@ -1236,6 +1296,460 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
 
 
 # --- Stats / assignees / worker log / dispatch / model options ---------------
+
+# ---------------------------------------------------------------------------
+# Cost trend — last N days of model spend (local estimates), bucketed in
+# Europe/London. Same data logic as the analytics endpoint: sessions table
+# + auxiliary session_model_usage rows merged per day. Powers the board's
+# corner widget. Estimates, not invoices.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/cost-trend")
+def get_cost_trend(days: int = Query(7, ge=2, le=60), board: Optional[str] = Query(None)):
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/London")
+    today = _dt.datetime.now(tz).date()
+    lo = _dt.datetime(today.year, today.month, today.day, tzinfo=tz) - _dt.timedelta(days=days - 1)
+    hi = lo + _dt.timedelta(days=days)
+
+    def day_key(ts: float) -> str:
+        return _dt.datetime.fromtimestamp(ts, tz).date().isoformat()
+
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile
+
+    db = _open_session_db_for_profile(None, read_only=True)
+    try:
+        main_rows = db._conn.execute(
+            "SELECT model, started_at, estimated_cost_usd, "
+            "COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read_tokens,0) "
+            "FROM sessions WHERE started_at >= ? AND started_at < ? AND model IS NOT NULL",
+            (lo.timestamp(), hi.timestamp()),
+        ).fetchall()
+        try:
+            aux_rows = db._conn.execute(
+                "SELECT u.model, s.started_at, u.estimated_cost_usd, "
+                "COALESCE(u.input_tokens,0), COALESCE(u.output_tokens,0), COALESCE(u.cache_read_tokens,0) "
+                "FROM session_model_usage u JOIN sessions s ON s.id = u.session_id "
+                "WHERE s.started_at >= ? AND s.started_at < ? AND u.task != ''",
+                (lo.timestamp(), hi.timestamp()),
+            ).fetchall()
+        except Exception:
+            aux_rows = []
+    finally:
+        db.close()
+
+    day_list = [today - _dt.timedelta(days=i) for i in range(days - 1, -1, -1)]
+    costs = {d.isoformat(): 0.0 for d in day_list}
+    toks = {d.isoformat(): {"inp": 0, "out": 0, "cr": 0} for d in day_list}
+    for r in main_rows + aux_rows:
+        started_at, est, inp, out, cr = r[1], r[2], r[3], r[4], r[5]
+        key = day_key(started_at)
+        if key not in costs:
+            continue
+        if est is not None:
+            costs[key] += float(est)
+        toks[key]["inp"] += int(inp or 0)
+        toks[key]["out"] += int(out or 0)
+        toks[key]["cr"] += int(cr or 0)
+
+    total_tokens = sum(t["inp"] + t["out"] + t["cr"] for t in toks.values())
+    cache_total = sum(t["cr"] for t in toks.values())
+
+    return {
+        "days": [
+            {
+                "day": d.isoformat(),
+                "label": d.strftime("%a"),
+                "cost": round(costs[d.isoformat()], 4),
+                "tokens": toks[d.isoformat()],
+                "is_today": d == today,
+            }
+            for d in day_list
+        ],
+        "total": round(sum(costs.values()), 4),
+        "totals": {
+            "tokens": total_tokens,
+            "cache_read": cache_total,
+            "cache_share_pct": round(cache_total / total_tokens * 100, 1) if total_tokens else 0,
+        },
+        "unit": "USD (local estimate)",
+    }
+
+
+@router.get("/model-usage")
+def get_model_usage(board: Optional[str] = Query(None),
+                    month: Optional[str] = Query(None)):
+    """Spend per model (local estimates), sessions + aux merged.
+
+    Default: month-to-date (current month). Pass ``?month=YYYY-MM`` to get a
+    full historical month (1st of that month through 1st of the next).
+    """
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/London")
+    now = _dt.datetime.now(tz)
+
+    if month:
+        try:
+            y, m = map(int, month.split("-"))
+            month_start = _dt.datetime(y, m, 1, tzinfo=tz)
+            next_month_start = _dt.datetime(y + (1 if m == 12 else 0),
+                                            (m % 12) + 1, 1, tzinfo=tz)
+        except Exception:
+            raise HTTPException(status_code=400,
+                                detail="month must be YYYY-MM (e.g. 2026-06)")
+        lo = month_start.timestamp()
+        hi = next_month_start.timestamp()
+        days_elapsed = (next_month_start - month_start).days
+        is_current = (month == now.strftime("%Y-%m"))
+        label = month_start.strftime("%B %Y")
+    else:
+        month_start = _dt.datetime(now.year, now.month, 1, tzinfo=tz)
+        lo = month_start.timestamp()
+        hi = (now + _dt.timedelta(days=1)).timestamp()
+        days_elapsed = now.day
+        is_current = True
+        label = now.strftime("%B %Y")
+
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile
+
+    db = _open_session_db_for_profile(None, read_only=True)
+    try:
+        main_rows = db._conn.execute(
+            "SELECT model, SUM(input_tokens), SUM(output_tokens), "
+            "SUM(cache_read_tokens), COALESCE(SUM(estimated_cost_usd),0), "
+            "SUM(COALESCE(api_call_count,0)) "
+            "FROM sessions WHERE started_at >= ? AND started_at < ? "
+            "AND model IS NOT NULL GROUP BY model",
+            (lo, hi),
+        ).fetchall()
+        try:
+            aux_rows = db._conn.execute(
+                "SELECT u.model, SUM(u.input_tokens), SUM(u.output_tokens), "
+                "SUM(u.cache_read_tokens), COALESCE(SUM(u.estimated_cost_usd),0), "
+                "SUM(COALESCE(u.api_call_count,0)) "
+                "FROM session_model_usage u JOIN sessions s ON s.id = u.session_id "
+                "WHERE s.started_at >= ? AND s.started_at < ? AND u.task != '' "
+                "GROUP BY u.model",
+                (lo, hi),
+            ).fetchall()
+        except Exception:
+            aux_rows = []
+    finally:
+        db.close()
+
+    per_model: dict[str, dict] = {}
+    for m, inp, out, cr, est, calls in main_rows:
+        per_model[m] = {"cost": float(est or 0), "calls": int(calls or 0),
+                        "input": int(inp or 0), "output": int(out or 0),
+                        "cache_read": int(cr or 0)}
+    for m, inp, out, cr, est, calls in aux_rows:
+        d = per_model.setdefault(m, {"cost": 0.0, "calls": 0, "input": 0, "output": 0, "cache_read": 0})
+        d["cost"] += float(est or 0)
+        d["calls"] += int(calls or 0)
+        d["input"] += int(inp or 0)
+        d["output"] += int(out or 0)
+        d["cache_read"] += int(cr or 0)
+
+    models = [{"model": m, **d} for m, d in per_model.items()]
+    models.sort(key=lambda x: -x["cost"])
+
+    return {
+        "month": month or now.strftime("%Y-%m"),
+        "label": label,
+        "days_elapsed": days_elapsed,
+        "is_current": is_current,
+        "models": models,
+        "total": round(sum(m["cost"] for m in models), 4),
+        "unit": "USD (local estimate)",
+    }
+
+
+
+_tavily_cache: dict = {}
+
+
+@router.get("/agent-health")
+def get_agent_health(board: Optional[str] = Query(None)):
+    """At-a-glance agent stats: memory usage (MD files vs limits), cron
+    health (last 24h), and today's session/call counts."""
+    import datetime as _dt
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+
+    from hermes_cli.config import load_config
+
+    tz = ZoneInfo("Europe/London")
+    now = _dt.datetime.now(tz)
+    hermes_home = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+
+    # Memory usage vs configured char limits. Counts EXACTLY like the memory
+    # tool (tools/memory_tool.py _char_count): split on "\n§\n", strip each
+    # entry, drop empties, dedupe, join and count — NOT raw file bytes (the
+    # file carries formatting/whitespace that would inflate the %).
+    cfg = load_config()
+    mem_cfg = cfg.get("memory") or {}
+    mem_limit = int(mem_cfg.get("memory_char_limit", 2200) or 2200)
+    user_limit = int(mem_cfg.get("user_char_limit", 1375) or 1375)
+    memory = []
+    for name, fname, limit in (
+        ("MEMORY.md", "memories/MEMORY.md", mem_limit),
+        ("USER.md", "memories/USER.md", user_limit),
+    ):
+        p = hermes_home / fname
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            entries = [e.strip() for e in text.split("\n§\n")]
+            entries = [e for e in entries if e]
+            entries = list(dict.fromkeys(entries))
+            chars = len("\n§\n".join(entries)) if entries else 0
+            pct = round(chars / limit * 100, 1) if limit else None
+        except Exception:
+            chars, pct = None, None
+        memory.append({
+            "name": name,
+            "bytes": p.stat().st_size if p.exists() else 0,
+            "chars": chars,
+            "limit": limit,
+            "pct": pct,
+        })
+
+    # Cron health: runs in the last 24h, and any that did not complete
+    cron_total = 0
+    cron_failed = 0
+    cron_db = hermes_home / "cron" / "executions.db"
+    try:
+        cdb = sqlite3.connect(str(cron_db))
+        cutoff = (now - _dt.timedelta(days=1)).isoformat()
+        cron_total = int(cdb.execute(
+            "SELECT COUNT(*) FROM executions WHERE started_at >= ?", (cutoff,)
+        ).fetchone()[0] or 0)
+        cron_failed = int(cdb.execute(
+            "SELECT COUNT(*) FROM executions WHERE started_at >= ? AND status != 'completed'",
+            (cutoff,),
+        ).fetchone()[0] or 0)
+        cdb.close()
+    except Exception:
+        pass
+
+    # Sessions + API calls today
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile
+
+    db = _open_session_db_for_profile(None, read_only=True)
+    try:
+        day0 = _dt.datetime(now.year, now.month, now.day, tzinfo=tz).timestamp()
+        row = db._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(api_call_count),0) FROM sessions WHERE started_at >= ?",
+            (day0,),
+        ).fetchone()
+        sessions_today = int(row[0] or 0)
+        calls_today = int(row[1] or 0)
+        # Local intra-day tally of Tavily web_extract calls (no API lag —
+        # Tavily's usage counter lags their dashboard, so we count our own).
+        try:
+            today_extracts = int(db._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE tool_name='web_extract' "
+                "AND timestamp >= ? AND timestamp < ?",
+                (day0, day0 + 86400),
+            ).fetchone()[0] or 0)
+            yesterday_extracts = int(db._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE tool_name='web_extract' "
+                "AND timestamp >= ? AND timestamp < ?",
+                (day0 - 86400, day0),
+            ).fetchone()[0] or 0)
+        except Exception:
+            today_extracts = yesterday_extracts = 0
+    finally:
+        db.close()
+
+    # Tavily usage (web extract backend) — credits on the account's plan, plus
+    # the LOCAL intra-day tally of web_extract calls (Tavily's API counter can
+    # lag their dashboard, so the local count is the lag-free view).
+    #
+    # Server-side cache: the external fetch is expensive-ish and the counter
+    # lags anyway, so we re-fetch the API at most every 2h, flat. The LOCAL
+    # tally (today/yesterday extracts) is computed per-request below and is
+    # ALWAYS fresh, cached or not. Deliberately NO activity keying: keying on
+    # (sessions_today, api_calls_today) invalidated the cache on almost every
+    # poll while any conversation was active — an open dashboard tab then
+    # burned a Tavily API call every 2h poll (and far worse if the page was
+    # reloaded often). 2h flat TTL caps that at ~12 Tavily calls/day max,
+    # regardless of chat activity or page reloads.
+    now_ts = time.time()
+    cached = _tavily_cache.get("payload")
+    if cached is not None and now_ts - _tavily_cache.get("ts", 0.0) <= 7200:
+        tavily = dict(cached)
+        tavily["today_extracts"] = today_extracts
+        tavily["yesterday_extracts"] = yesterday_extracts
+    else:
+        tavily = {"today_extracts": today_extracts, "yesterday_extracts": yesterday_extracts}
+        try:
+            import urllib.request
+
+            def _clean_env(v: str) -> str:
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    return v[1:-1]
+                return v
+
+            tkey = None
+            env_path = hermes_home / ".env"
+            if env_path.exists():
+                for line in env_path.read_text().splitlines():
+                    if line.strip().startswith("TAVILY_API_KEY="):
+                        tkey = _clean_env(line.split("=", 1)[1])
+                        break
+            if tkey:
+                req = urllib.request.Request(
+                    "https://api.tavily.com/usage",
+                    headers={"Authorization": f"Bearer {tkey}"},
+                )
+                resp = json.loads(urllib.request.urlopen(req, timeout=8).read().decode())
+                acct = resp.get("account") or {}
+                plan_limit = acct.get("plan_limit")
+                if plan_limit:
+                    plan_usage = float(acct.get("plan_usage") or 0)
+                    tavily.update({
+                        "plan": acct.get("current_plan") or "plan",
+                        "used": plan_usage,
+                        "limit": float(plan_limit),
+                        "remaining": max(0.0, float(plan_limit) - plan_usage),
+                        "pct": round(plan_usage / float(plan_limit) * 100, 1),
+                        "breakdown": {
+                            "search": float(acct.get("search_usage") or 0),
+                            "crawl": float(acct.get("crawl_usage") or 0),
+                            "extract": float(acct.get("extract_usage") or 0),
+                            "map": float(acct.get("map_usage") or 0),
+                            "research": float(acct.get("research_usage") or 0),
+                        },
+                    })
+        except Exception:
+            pass
+        _tavily_cache["ts"] = now_ts
+        _tavily_cache["payload"] = tavily
+
+    return {
+        "memory": memory,
+        "cron": {"runs_24h": cron_total, "failed_24h": cron_failed},
+        "sessions_today": sessions_today,
+        "api_calls_today": calls_today,
+        "tavily": tavily,
+        "as_of": now.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health check — nightly self-check results (run by cron 22:30 + Run-now)
+# ---------------------------------------------------------------------------
+
+@router.get("/system-stats")
+def get_system_stats():
+    """Live Ubuntu container stats: CPU %, load, RAM, disk (root + Hermes
+    home), uptime, gateway RSS.
+
+    Pure local reads (/proc/stat, /proc/meminfo, statvfs, ps) — no external
+    calls, no tokens, no caching needed. CPU % is a short-window sample
+    (two /proc/stat reads ~0.3s apart) so the widget always shows a real
+    utilisation figure, not just the load average.
+    """
+    import subprocess
+    import datetime as _dt
+
+    hermes_home = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+
+    # --- CPU % (short-window sample) + load ---
+    def _proc_stat_cpu():
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("cpu "):
+                parts = [int(x) for x in line.split()[1:]]
+                idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+                return sum(parts), idle
+        return None, None
+
+    t0, idle0 = _proc_stat_cpu()
+    time.sleep(0.3)
+    t1, idle1 = _proc_stat_cpu()
+    cpu_pct = None
+    if (t0 is not None and t1 is not None and idle0 is not None and idle1 is not None
+            and t1 > t0):
+        cpu_pct = round((1 - (idle1 - idle0) / (t1 - t0)) * 100, 1)
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cores = os.cpu_count() or 1
+    except Exception:
+        load1 = load5 = load15 = cores = None
+
+    # --- RAM ---
+    ram = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            ram[k] = int(v.strip().split()[0])
+        total = ram.get("MemTotal", 0) / 2**20
+        avail = ram.get("MemAvailable", 0) / 2**20
+    except Exception:
+        total = avail = 0.0
+    ram_pct = round((1 - avail / total) * 100, 1) if total else None
+
+    # --- Disk ---
+    disks = []
+    for label, path in (("root", "/"), ("~/.hermes", str(hermes_home))):
+        try:
+            st = os.statvfs(path)
+            total_b = st.f_blocks * st.f_frsize
+            free_b = st.f_bavail * st.f_frsize
+            used_b = total_b - free_b
+            disks.append({
+                "label": label, "path": path,
+                "total_gb": round(total_b / 2**30, 1),
+                "used_gb": round(used_b / 2**30, 1),
+                "free_gb": round(free_b / 2**30, 1),
+                "pct": round(used_b / total_b * 100, 1) if total_b else None,
+            })
+        except Exception:
+            disks.append({"label": label, "path": path, "error": True})
+
+    # --- Uptime ---
+    try:
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        uptime_s = None
+
+    # --- Gateway RSS ---
+    gateway_rss_mb = None
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "hermes_cli.main"], capture_output=True, text=True, timeout=10
+        ).stdout.strip().splitlines()
+        if out:
+            pid = int(out[0].split()[0])
+            rss = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+            gateway_rss_mb = round(int(rss) / 1024, 0) if rss.strip() else None
+    except Exception:
+        pass
+
+    return {
+        "cpu_pct": cpu_pct,
+        "load1": round(load1, 2) if load1 is not None else None,
+        "load5": round(load5, 2) if load5 is not None else None,
+        "load15": round(load15, 2) if load15 is not None else None,
+        "cores": cores,
+        "ram_total_gb": round(total, 1),
+        "ram_used_gb": round(total - avail, 1) if total else None,
+        "ram_avail_gb": round(avail, 1),
+        "ram_pct": ram_pct,
+        "disks": disks,
+        "uptime_s": uptime_s,
+        "gateway_rss_mb": gateway_rss_mb,
+        "as_of": _dt.datetime.now().isoformat(),
+    }
+
 
 @router.get("/stats")
 def get_stats(board: Optional[str] = Query(None)):
